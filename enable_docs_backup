@@ -1,0 +1,79 @@
+#!/bin/bash
+#creates an anacron weekly script to automatically back up the home/user/Documents folder 
+#to a zip file in the google drive folder mounted with ocamlfuse. Keeps one copy of the last backup
+#and one of the current one. Performs a full backup each time, deleting the last-but-one 
+#backup as it goes.
+#must be run for each user that wants automatic documents backup
+#can be easily modified to store in dropbox local folder instead of google drive local folder.
+#
+#Error Codes
+#	1	Couldn't access/create $tmpfolder
+#	2	Couldn't create $backupfolder
+
+
+gdrivefolder=""
+mountinfo=($(mount | grep google-drive-ocamlfuse)) # search mounted drives for google drive mount point, store output in an array
+gdrivefolder="${mountinfo[2]}" #GDrive folder is the third element in the array
+scriptfile="/etc/cron.weekly/docs-backup-$USER" #where to put the weekly backup script
+zipfile="docs-backup-full.zip" #name of the archive
+backupfolder="$gdrivefolder/Backups" #where we're going to store it
+docsfolder="$HOME/Documents" #what to back up
+logfile="/var/log/backup.log" #where to output the log
+zipcmd="$(which zip)" #points to the specific location of zip
+nicecmd="$(which nice)" #ditto nice
+
+if [[ ! -z "$zipcmd" ]]; then #if zipcmd is not blank, zip is installed
+  if [[ "${mountinfo[0]}" = "google-drive-ocamlfuse" ]]; then #is google drive mounted?
+    if [[ ! -d "$backupfolder" ]]; then #If the backup folder doesn't exist
+      if ! mkdir -p "$backupfolder"; then #make it and test for failure
+        echo "Could not create Backups folder $backupfolder. Please create and try again."
+        exit 2
+      fi
+    fi 
+    echo "Need sudo to do this. You may be asked for your password..."
+    echo
+    cat <<- _EOF_ | sudo tee "$scriptfile" > /dev/null # create the weekly script to backup the documents folder
+		#!/bin/bash
+		killed() {
+		  rm -v "/tmp/$USER-$zipfile" >> "$logfile"
+		  echo "Documents Backup Aborted for $USER at \$(date)" >> $logfile
+		  exit 1
+		}
+		failexit() {
+		  test -e "/tmp/$USER-$zipfile" && rm -v "/tmp/$USER-$zipfile" >> "$logfile"
+		  echo "Documents Backup Failed for $USER at \$(date)." >> "$logfile"
+		  exit 2
+		}
+		trap killed SIGINT SIGTERM SIGHUP
+		if [[ ! -e "$logfile" ]]; then
+		  echo "Log created: \$(date)" > "$logfile"
+		fi
+		echo >> "$logfile"
+		echo "Making Documents Backup for $USER at \$(date)..." >> "$logfile"
+		if [[ -e "/tmp/$USER-$zipfile" ]]; then
+		  rm -v "/tmp/$USER-$zipfile" >> "$logfile"
+		fi
+		if ((sudo -u $USER $nicecmd -n 20 $zipcmd -rq "/tmp/$USER-$zipfile" "$docsfolder"/*) >> "$logfile" 2>&1); then # make the zip file in /tmp because accessing gdrive is slow
+		  ((sudo -u $USER test -e "$backupfolder/$zipfile.bak") && (sudo -u $USER rm -v "$backupfolder/$zipfile.bak") >> "$logfile" 2>&1) # remove the old backup of the zip file
+		  ((sudo -u $USER test -e "$backupfolder/$zipfile") && (sudo -u $USER mv -v "$backupfolder/$zipfile" "$backupfolder/$zipfile.bak") >> "$logfile" 2>&1) # rename the old zip file, making it a backup
+		  if ((sudo -u $USER mv -v "/tmp/$USER-$zipfile" "$backupfolder/$zipfile") >> "$logfile" 2>&1); then # move the new zip file into the user's GoogleDrive folder
+		    echo "Finished Documents Backup for $USER at \$(date)." >> "$logfile"
+		  else
+		    echo "Could not move $USER-$zipfile from /tmp/ to $backupfolder." >> "$logfile" 
+		    failexit
+		  fi
+		else
+		  echo "Errors during creation of /tmp/$USER-$zipfile."
+		  failexit
+		fi
+		_EOF_
+    # end of weekly script
+    sudo chmod a+x "$scriptfile" # make the weekly script executable
+    echo "Script created."
+  else
+    echo "Google Drive mount point not located. Please use ocamlfuse method to create it."
+    echo "https://www.techrepublic.com/article/how-to-mount-your-google-drive-on-linux-with-google-drive-ocamlfuse/"
+  fi
+else
+  echo "zip not installed. Please install it!"
+fi
